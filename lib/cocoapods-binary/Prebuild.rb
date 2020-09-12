@@ -1,7 +1,7 @@
 require_relative 'rome/build_framework'
 require_relative 'helper/passer'
 require_relative 'helper/target_checker'
-
+require_relative 'helper/shared_cache'
 
 # patch prebuild ability
 module Pod
@@ -11,20 +11,14 @@ module Pod
         private
 
         def local_manifest 
-            if not @local_manifest_inited
-                @local_manifest_inited = true
-                raise "This method should be call before generate project" unless self.analysis_result == nil
-                @local_manifest = self.sandbox.manifest
-            end
-            @local_manifest
+            self.sandbox.manifest
         end
 
         # @return [Analyzer::SpecsState]
         def prebuild_pods_changes
             return nil if local_manifest.nil?
-            if @prebuild_pods_changes.nil?
-                changes = local_manifest.detect_changes_with_podfile(podfile)
-                @prebuild_pods_changes = Analyzer::SpecsState.new(changes)
+            if @prebuild_pods_changes.nil? && !self.analysis_result.nil?
+                @prebuild_pods_changes = self.analysis_result.sandbox_state
                 # save the chagnes info for later stage
                 Pod::Prebuild::Passer.prebuild_pods_changes = @prebuild_pods_changes 
             end
@@ -40,6 +34,8 @@ module Pod
             return false if local_manifest == nil
             
             changes = prebuild_pods_changes
+            return false if changes.nil?
+            
             added = changes.added
             changed = changes.changed 
             unchanged = changes.unchanged
@@ -70,6 +66,11 @@ module Pod
             # build options
             sandbox_path = sandbox.root
             existed_framework_folder = sandbox.generate_framework_path
+            options = [
+                Podfile::DSL.bitcode_enabled,
+                Podfile::DSL.custom_build_options,
+                Podfile::DSL.custom_build_options_simulator
+            ]
             bitcode_enabled = Pod::Podfile::DSL.bitcode_enabled
             targets = []
             
@@ -117,13 +118,20 @@ module Pod
             Pod::Prebuild.remove_build_dir(sandbox_path)
             targets.each do |target|
                 if !target.should_build?
-                    UI.puts "Prebuilding #{target.label}"
+                    STDERR.puts "[!] Prebuilding #{target.label} is unnecessary".red
                     next
                 end
 
                 output_path = sandbox.framework_folder_path_for_target_name(target.name)
                 output_path.mkpath unless output_path.exist?
-                Pod::Prebuild.build(sandbox_path, target, output_path, bitcode_enabled,  Podfile::DSL.custom_build_options,  Podfile::DSL.custom_build_options_simulator)
+                if Prebuild::SharedCache.has?(target, options)
+                    framework_cache_path = Prebuild::SharedCache.local_framework_cache_path_for(target, options)
+                    UI.puts "Using #{target.label} from cache"
+                    FileUtils.cp_r "#{framework_cache_path}/.", output_path
+                else
+                    Pod::Prebuild.build(sandbox_path, target, output_path, *options)
+                    Prebuild::SharedCache.cache(target, output_path, options)
+                end
 
                 # save the resource paths for later installing
                 if target.static_framework? and !target.resource_paths.empty?
@@ -165,6 +173,7 @@ module Pod
                 # This is for target with only .a and .h files
                 if not target.should_build? 
                     Prebuild::Passer.target_names_to_skip_integration_framework << target.name
+                    target_folder.mkpath unless target_folder.exist?
                     FileUtils.cp_r(root_path, target_folder, :remove_destination => true)
                     next
                 end
